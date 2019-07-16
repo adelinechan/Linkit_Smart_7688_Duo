@@ -1,0 +1,116 @@
+import requests
+import socket
+import threading
+import logging
+import mraa
+
+import time  
+import sys  
+import httplib, urllib  
+import json
+
+sys.path.insert(0, '/usr/lib/python2.7/bridge/')  
+from bridgeclient import BridgeClient as bridgeclient
+
+value = bridgeclient()
+
+# change this to the values from MCS web console
+DEVICE_INFO = {
+    'device_id' : 'DLzaLtPr',
+    'device_key' : '11ImLkaTO3m27DNv'
+}
+
+# change 'INFO' to 'WARNING' to filter info messages
+logging.basicConfig(level='INFO')
+
+heartBeatTask = None
+
+deviceId = "DLzaLtPr"  
+deviceKey = "11ImLkaTO3m27DNv"
+
+def establishCommandChannel():
+    # Query command server's IP & port
+    connectionAPI = 'https://api.mediatek.com/mcs/v2/devices/%(device_id)s/connections.csv'
+    r = requests.get(connectionAPI % DEVICE_INFO,
+                 headers = {'deviceKey' : DEVICE_INFO['device_key'],
+                            'Content-Type' : 'application/json'})
+    logging.info("Command Channel IP,port=" + r.text)
+    (ip, port) = r.text.split(',')
+
+    # Connect to command server
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect((ip, int(port)))
+    s.settimeout(None)
+
+    # Heartbeat for command server to keep the channel alive
+    def sendHeartBeat(commandChannel):
+        keepAliveMessage = '%(device_id)s,%(device_key)s,0' % DEVICE_INFO
+        commandChannel.sendall(keepAliveMessage)
+        logging.info("beat:%s" % keepAliveMessage)
+
+    def heartBeat(commandChannel):
+        sendHeartBeat(commandChannel)
+        # Re-start the timer periodically
+        global heartBeatTask
+        heartBeatTask = threading.Timer(20, heartBeat, [commandChannel]).start()
+    heartBeat(s)
+    return s
+
+def post_to_mcs(payload):  
+    headers = {"Content-type": "application/json", "deviceKey": deviceKey}
+    not_connected = 1
+    while (not_connected):
+        try:
+            conn = httplib.HTTPConnection("api.mediatek.com:80")
+            conn.connect()
+            not_connected = 0
+        except (httplib.HTTPException, socket.error) as ex:
+            print "Error: %s" % ex
+            time.sleep(10)  # sleep 10 seconds
+
+    conn.request("POST", "/mcs/v2/devices/" + deviceId + "/datapoints", json.dumps(payload), headers)
+    response = conn.getresponse()
+    print( response.status, response.reason, json.dumps(payload), time.strftime("%c"))
+    data = response.read()
+    conn.close()
+
+def waitAndExecuteCommand(commandChannel):
+    while True:
+
+        command = commandChannel.recv(1024)
+        logging.info("recv:" + command)
+        # command can be a response of heart beat or an update of the Switch_Control,
+        # so we split by ',' and drop device id and device key and check length
+        fields = command.split(',')[2:]
+
+        if len(fields) > 1:
+            timeStamp, dataChannelId, commandString = fields
+            if dataChannelId == 'Switch':
+                # check the value - it's either 0 or 1
+                commandValue = int(commandString)
+                logging.info("Switch :%d" % commandValue)
+                setSwitch(commandValue) 
+       
+        h0 = value.get("Humidity")
+        t0 = value.get("Temperature")
+        payload = {"datapoints":[{"dataChnId":"Humidity","values":{"value":h0}},{"dataChnId":"Temperature","values":{"value":t0}}]}
+        post_to_mcs(payload) 
+
+
+pin = None
+def setupSwitch():
+    global pin
+    # on LinkIt Smart 7699, pin 0 is D7 pin.
+    pin = mraa.Gpio(0)
+    pin.dir(mraa.DIR_OUT)
+
+def setSwitch(state):
+    if state:
+        pin.write(1)
+    else:
+        pin.write(0)
+
+if __name__ == '__main__':
+    setupSwitch()
+    channel = establishCommandChannel()
+    waitAndExecuteCommand(channel)
